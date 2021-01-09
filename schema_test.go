@@ -14,6 +14,7 @@ import (
 
 	// Postgres database driver
 	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/ory/dockertest"
 )
@@ -31,6 +32,10 @@ var DBConns map[string]*ConnInfo = map[string]*ConnInfo{
 		Driver:     "postgres",
 		DockerRepo: "postgres",
 		DockerTag:  "11",
+	},
+	"sqlite": &ConnInfo{
+		Driver: "sqlite3",
+		DSN:    "./test.db",
 	},
 }
 
@@ -89,8 +94,10 @@ func TestMain(m *testing.M) {
 	// Purge all the containers we created
 	// You can't defer this because os.Exit doesn't execute defers
 	for _, info := range DBConns {
-		if err := pool.Purge(info.Resource); err != nil {
-			log.Fatalf("Could not purge	resource: %s", err)
+		if info.Resource != nil {
+			if err := pool.Purge(info.Resource); err != nil {
+				log.Fatalf("Could not purge	resource: %s", err)
+			}
 		}
 	}
 
@@ -279,4 +286,51 @@ func connectDB(t *testing.T, name string) *sql.DB {
 		t.Error(err)
 	}
 	return db
+}
+
+func TestMigrationsAppliedLexicalOrderByID_SQLITE(t *testing.T) {
+	db := connectDB(t, "sqlite")
+	tableName := "lexical_order_migrations"
+	migrator := NewMigrator(WithDialect(SQLite), WithTableName(tableName))
+	outOfOrderMigrations := []*Migration{
+		{
+			ID:     "2019-01-01 999 Should Run Last",
+			Script: "CREATE TABLE last_table (id INTEGER NOT NULL);",
+		},
+		{
+			ID:     "2019-01-01 001 Should Run First",
+			Script: "CREATE TABLE first_table (id INTEGER NOT NULL);",
+		},
+	}
+	err := migrator.Apply(db, outOfOrderMigrations)
+	if err != nil {
+		t.Error(err)
+	}
+
+	applied, err := migrator.GetAppliedMigrations(db)
+	if err != nil {
+		t.Error(err)
+	}
+	if len(applied) != 2 {
+		t.Errorf("Expected exactly 2 applied migrations. Got %d", len(applied))
+	}
+	firstMigration := applied["2019-01-01 001 Should Run First"]
+	if firstMigration == nil {
+		t.Error("Missing first migration")
+	}
+	if firstMigration.Checksum == "" {
+		t.Error("Expected checksum to get populated when migration ran")
+	}
+
+	secondMigration := applied["2019-01-01 999 Should Run Last"]
+	if secondMigration == nil {
+		t.Error("Missing second migration")
+	}
+	if secondMigration.Checksum == "" {
+		t.Error("Expected checksum to get populated when migration ran")
+	}
+
+	if firstMigration.AppliedAt.After(secondMigration.AppliedAt) {
+		t.Errorf("Expected migrations to run in lexical order, but first migration ran at %s and second one ran at %s", firstMigration.AppliedAt, secondMigration.AppliedAt)
+	}
 }
