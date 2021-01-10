@@ -11,7 +11,7 @@ import (
 )
 
 func TestSQLiteLocking(t *testing.T) {
-	testfile := filepath.Join(os.TempDir(), "schema_test.db")
+	testfile := filepath.Join(os.TempDir(), "sqlite_test.db")
 	os.Remove(testfile)
 	defer os.Remove(testfile)
 

@@ -10,6 +10,8 @@ import (
 // hold the status of applied migrations
 const DefaultTableName = "schema_migrations"
 
+const DefaultLockTableName = "schema_locks"
+
 // ErrNilDB is thrown when the database pointer is nil
 var ErrNilDB = errors.New("DB pointer is nil")
 

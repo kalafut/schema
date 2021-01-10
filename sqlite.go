@@ -2,6 +2,7 @@ package schema
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,10 +16,16 @@ var SQLite = &sqliteDialect{}
 
 var _ Locker = SQLite
 
+const lockMagicNum = 794774819
+const defaultSQLiteLockTable = "schema_lock"
+
 // SQLite is the SQLite dialect
 type sqliteDialect struct {
-	lockCode int64
-	lock     sync.Mutex
+	LockDuration time.Duration
+	LockTable    string
+
+	code int64
+	lock sync.Mutex
 }
 
 func (s sqliteDialect) LockSQL(_ string) string {
@@ -32,21 +39,35 @@ func (s sqliteDialect) UnlockSQL(_ string) string {
 func (s *sqliteDialect) Lock(db *sql.DB) error {
 	s.lock.Lock()
 
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS migration_lock(
+	table := s.LockTable
+	if table == "" {
+		table = defaultSQLiteLockTable
+	}
+	_, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
 			id INTEGER PRIMARY KEY,
-			expiration DATETIME NOT NULL)`)
+			code INTEGER,
+			expiration DATETIME NOT NULL)`, table))
 	if err != nil {
 		return err
 	}
 
-	for {
-		_, err := db.Exec(`DELETE FROM migration_lock WHERE datetime(expiration) < datetime('now')`)
-		if err != nil {
+	timeoutDuration := s.LockDuration
+	if timeoutDuration == 0 {
+		const defaultDuration = 30 * time.Second
+		timeoutDuration = defaultDuration
+	}
+	timeout := time.Now().Add(timeoutDuration)
+
+	for time.Now().Before(timeout) {
+		if _, err := db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE datetime(expiration) < datetime('now')`, table)); err != nil {
 			return err
 		}
 
-		_, err = db.Exec(`INSERT INTO migration_lock(id, expiration) VALUES(42, ?)`, time.Now().Add(1*time.Minute))
+		code := time.Now().UnixNano()
+		_, err = db.Exec(
+			fmt.Sprintf(`INSERT INTO %s (id, code, expiration) VALUES(?, ?, ?)`, table),
+			lockMagicNum, code, time.Now().Add(timeoutDuration))
 
 		switch err := err.(type) {
 		case sqlite3.Error:
@@ -56,58 +77,33 @@ func (s *sqliteDialect) Lock(db *sql.DB) error {
 				return err
 			}
 		default:
+			s.code = code
 			return nil
 		}
 	}
-}
 
-func (s *sqliteDialect) Lock2(db *sql.DB) error {
-	s.lock.Lock()
-
-	result, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS migration_lock (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			expiration DATETIME NOT NULL
-		);
-		INSERT INTO migration_lock(expiration) VALUES(?)`, time.Now().Add(1*time.Minute))
-	if err != nil {
-		return err
-	}
-	s.lockCode, err = result.LastInsertId()
-	if err != nil {
-		return err
-	}
-
-	var min int64
-	for {
-		_, err := db.Exec(`DELETE FROM migration_lock WHERE datetime(expiration) < datetime('now')`)
-		if err != nil {
-			return err
-		}
-
-		row := db.QueryRow(`SELECT min(id) FROM migration_lock;`)
-
-		if err := row.Scan(&min); err != nil {
-			return err
-		}
-
-		if min == s.lockCode {
-			return nil
-		}
-
-		time.Sleep(time.Second)
-	}
+	return errors.New("sqlite: timeout requesting lock")
 }
 
 func (s *sqliteDialect) Unlock(db *sql.DB) error {
-	_, err := db.Exec(`DELETE FROM migration_lock`, s.lockCode)
-	s.lock.Unlock()
+	defer s.lock.Unlock()
+
+	table := s.LockTable
+	if table == "" {
+		table = defaultSQLiteLockTable
+	}
+
+	// Delete only the lock we created by checking 'code'. This guards against the
+	// edge case where another process has deleted our expired lock and grabbed
+	// their own just before we process Unlock().
+	_, err := db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE id=? AND code=?;`, table), lockMagicNum, s.code)
+
 	return err
 }
 
 // CreateSQL takes the name of the migration tracking table and
 // returns the SQL statement needed to create it
-func (s *sqliteDialect) CreateSQL(tableName string) string {
+func (s sqliteDialect) CreateSQL(tableName string) string {
 	return fmt.Sprintf(`
 				CREATE TABLE IF NOT EXISTS %s (
 					id TEXT NOT NULL,
