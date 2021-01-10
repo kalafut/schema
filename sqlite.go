@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
@@ -13,6 +12,7 @@ import (
 
 // SQLite is the dialect for SQLite databases
 var SQLite = &sqliteDialect{}
+var ErrSQLiteLockTimeout = errors.New("sqlite: timeout requesting lock")
 
 var _ Locker = SQLite
 
@@ -25,7 +25,6 @@ type sqliteDialect struct {
 	LockTable    string
 
 	code int64
-	lock sync.Mutex
 }
 
 func (s sqliteDialect) LockSQL(_ string) string {
@@ -37,17 +36,11 @@ func (s sqliteDialect) UnlockSQL(_ string) string {
 }
 
 func (s *sqliteDialect) Lock(db *sql.DB) error {
-	s.lock.Lock()
-
-	table := s.LockTable
-	if table == "" {
-		table = defaultSQLiteLockTable
-	}
-	_, err := db.Exec(fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
+	_, err := db.Exec(s.addTable(`
+		CREATE TABLE IF NOT EXISTS {table} (
 			id INTEGER PRIMARY KEY,
 			code INTEGER,
-			expiration DATETIME NOT NULL)`, table))
+			expiration DATETIME NOT NULL)`))
 	if err != nil {
 		return err
 	}
@@ -60,13 +53,13 @@ func (s *sqliteDialect) Lock(db *sql.DB) error {
 	timeout := time.Now().Add(timeoutDuration)
 
 	for time.Now().Before(timeout) {
-		if _, err := db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE datetime(expiration) < datetime('now')`, table)); err != nil {
+		if _, err := db.Exec(s.addTable(`DELETE FROM {table} WHERE datetime(expiration) < datetime('now')`)); err != nil {
 			return err
 		}
 
 		code := time.Now().UnixNano()
 		_, err = db.Exec(
-			fmt.Sprintf(`INSERT INTO %s (id, code, expiration) VALUES(?, ?, ?)`, table),
+			s.addTable(`INSERT INTO {table} (id, code, expiration) VALUES(?, ?, ?)`),
 			lockMagicNum, code, time.Now().Add(timeoutDuration))
 
 		switch err := err.(type) {
@@ -82,21 +75,14 @@ func (s *sqliteDialect) Lock(db *sql.DB) error {
 		}
 	}
 
-	return errors.New("sqlite: timeout requesting lock")
+	return ErrSQLiteLockTimeout
 }
 
-func (s *sqliteDialect) Unlock(db *sql.DB) error {
-	defer s.lock.Unlock()
-
-	table := s.LockTable
-	if table == "" {
-		table = defaultSQLiteLockTable
-	}
-
+func (s sqliteDialect) Unlock(db *sql.DB) error {
 	// Delete only the lock we created by checking 'code'. This guards against the
 	// edge case where another process has deleted our expired lock and grabbed
 	// their own just before we process Unlock().
-	_, err := db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE id=? AND code=?;`, table), lockMagicNum, s.code)
+	_, err := db.Exec(s.addTable(`DELETE FROM {table} WHERE id=? AND code=?;`), lockMagicNum, s.code)
 
 	return err
 }
@@ -149,4 +135,13 @@ func (s sqliteDialect) QuotedTableName(_, tableName string) string {
 // quote character
 func (s sqliteDialect) quotedIdent(ident string) string {
 	return `"` + strings.ReplaceAll(ident, `"`, "") + `"`
+}
+
+func (s sqliteDialect) addTable(sql string) string {
+	table := s.LockTable
+	if table == "" {
+		table = defaultSQLiteLockTable
+	}
+
+	return strings.Replace(sql, "{table}", table, 1)
 }
