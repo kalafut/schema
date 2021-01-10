@@ -9,14 +9,27 @@ import "database/sql"
 //
 type Dialect interface {
 	QuotedTableName(schemaName, tableName string) string
-	LockSQL(tableName string) string
-	UnlockSQL(tableName string) string
 	CreateSQL(tableName string) string
 	SelectSQL(tableName string) string
 	InsertSQL(tableName string) string
 }
 
+// Locking is achieved by implementing at least one of the
+// Locker interfaces. If the database natively supports
+// locking through SQL, the SQLLocker is simpler. If neither
+// interface is present a panic will occur. 
+
+// Locker define an interface that implements locking.
 type Locker interface {
+	// Lock blocks until the lock is obtained. A non-nil
+	// return indicates failure to obtain the lock.
 	Lock(db *sql.DB) error
 	Unlock(db *sql.DB) error
+}
+
+// SQLLocker define an interface that implements locking
+// using a single SQL statement. 
+type SQLLocker interface {
+	LockSQL(tableName string) string
+	UnlockSQL(tableName string) string
 }
