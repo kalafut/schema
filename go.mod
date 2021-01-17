@@ -1,4 +1,4 @@
-module github.com/adlio/schema
+module github.com/kalafut/schema
 
 go 1.13
 
